@@ -1,0 +1,5 @@
+BattGUI_bin
+icon_gen_bin
+*.iconset/
+*.icns
+.DS_Store
