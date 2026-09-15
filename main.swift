@@ -9,8 +9,8 @@ func shellQuote(_ s: String) -> String {
     "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }
 
-func runBatt(_ args: [String], needsAdmin: Bool = true) -> String {
-    let cmdString = ([battBin] + args).map(shellQuote).joined(separator: " ")
+func runCommand(_ binary: String, _ args: [String], needsAdmin: Bool = true) -> String {
+    let cmdString = ([binary] + args).map(shellQuote).joined(separator: " ")
 
     if needsAdmin {
         let escaped = cmdString.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
@@ -27,7 +27,7 @@ func runBatt(_ args: [String], needsAdmin: Bool = true) -> String {
         return "Error: could not build AppleScript"
     } else {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: battBin)
+        process.executableURL = URL(fileURLWithPath: binary)
         process.arguments = args
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -41,6 +41,16 @@ func runBatt(_ args: [String], needsAdmin: Bool = true) -> String {
             return "Error: \(error.localizedDescription)"
         }
     }
+}
+
+func runBatt(_ args: [String], needsAdmin: Bool = true) -> String {
+    runCommand(battBin, args, needsAdmin: needsAdmin)
+}
+
+// Fallback for "block all sleep" when batt has no sleep hooks on this Mac: pmset's
+// disablesleep is the closest system-level equivalent (there is no charging-only variant).
+func runPmset(_ args: [String]) -> String {
+    runCommand("/usr/bin/pmset", args, needsAdmin: true)
 }
 
 struct BattStatus: Decodable {
@@ -98,6 +108,7 @@ class BattModel: ObservableObject {
     @Published var status: BattStatus?
     @Published var daemonReachable = true
     @Published var lastError: String?
+    @Published var pmsetSleepDisabled = false
 
     func run(_ args: [String], needsAdmin: Bool = true) {
         isBusy = true
@@ -118,9 +129,13 @@ class BattModel: ObservableObject {
         DispatchQueue.global(qos: .utility).async {
             let raw = runBatt(["status", "--json"], needsAdmin: false)
             let decoded = raw.data(using: .utf8).flatMap { try? JSONDecoder().decode(BattStatus.self, from: $0) }
+            // "SleepDisabled 1" in `pmset -g` reflects `pmset disablesleep 1`; readable without sudo.
+            let pmsetOutput = runCommand("/usr/bin/pmset", ["-g"], needsAdmin: false)
+            let sleepDisabled = pmsetOutput.split(separator: "\n").contains { $0.trimmingCharacters(in: .whitespaces).hasPrefix("SleepDisabled 1") }
             DispatchQueue.main.async {
                 self.daemonReachable = decoded != nil
                 if let decoded { self.status = decoded }
+                self.pmsetSleepDisabled = sleepDisabled
             }
         }
     }
@@ -139,6 +154,28 @@ class BattModel: ObservableObject {
 
     func toggle(_ command: String, _ on: Bool) {
         run([command, on ? "enable" : "disable"])
+    }
+
+    // "Block all sleep while charging" falls back to `pmset disablesleep` when batt has
+    // no sleep hooks on this Mac — the closest system-level equivalent, though it blocks
+    // sleep unconditionally rather than only while charging.
+    func toggleSystemSleepBlock(_ on: Bool) {
+        if supports(.sleepHooks) {
+            toggle("prevent-system-sleep", on)
+            return
+        }
+        isBusy = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = runPmset(["disablesleep", on ? "1" : "0"])
+            DispatchQueue.main.async {
+                self.log.insert(LogEntry(command: "pmset disablesleep \(on ? "1" : "0")", output: result.isEmpty ? "(no output)" : result), at: 0)
+                self.isBusy = false
+                if result.hasPrefix("Error:") && !result.contains("User canceled") {
+                    self.lastError = result
+                }
+                self.refreshStatus()
+            }
+        }
     }
 }
 
@@ -487,12 +524,22 @@ struct SleepPage: View {
                     Text("Stay awake while charging")
                     Text("Keeps your Mac from idling to sleep until it reaches the limit. Closing the lid still sleeps.")
                 }
-                Toggle(isOn: Binding(get: { c?.preventSystemSleep ?? false }, set: { model.toggle("prevent-system-sleep", $0) })) {
-                    Text("Block all sleep while charging (experimental)")
-                    Text("Also blocks lid-close and menu sleep until the limit is reached. Don't combine with the two options above.")
-                }
             }
             .disabled(!supported)
+
+            Section {
+                Toggle(isOn: Binding(
+                    get: { supported ? (c?.preventSystemSleep ?? false) : model.pmsetSleepDisabled },
+                    set: { model.toggleSystemSleepBlock($0) }
+                )) {
+                    Text("Block all sleep while charging (experimental)")
+                    if supported {
+                        Text("Also blocks lid-close and menu sleep until the limit is reached. Don't combine with the two options above.")
+                    } else {
+                        Text("batt can't do this on this Mac, so this uses macOS's own sleep setting (pmset) instead. Unlike batt's version, it blocks sleep all the time, not just while charging — turn it back off when you don't need it.")
+                    }
+                }
+            }
         }
         .formStyle(.grouped)
     }
