@@ -63,6 +63,7 @@ struct BattStatus: Decodable {
         let state: String
         let chargeRateWatts: Double?
         let voltageVolts: Double?
+        let timeToLimitMinutes: Int?
     }
     struct MagSafeLed: Decodable {
         let enabled: Bool
@@ -88,6 +89,56 @@ struct BattStatus: Decodable {
     let battery: Battery
     let configuration: Configuration
     let compatibility: Compatibility?
+
+    // batt's JSON uses camelCase enum values ("notCharging") that don't have word
+    // breaks for .capitalized to find, so it renders as "Notcharging" — spell each out.
+    var humanState: String {
+        switch battery.state {
+        case "charging": return "Charging"
+        case "discharging": return "Discharging"
+        case "notCharging": return "Not charging"
+        case "full": return "Full"
+        default: return battery.state.capitalized
+        }
+    }
+}
+
+// Extra battery detail (cycle count, health, design capacity) that batt doesn't report,
+// read straight from IOKit — no admin privileges needed.
+struct HardwareBatteryInfo {
+    let cycleCount: Int?
+    let designCapacityMah: Int?
+    let fullChargeCapacityMah: Int?
+    let temperatureCelsius: Double?
+
+    var healthPercent: Int? {
+        guard let design = designCapacityMah, design > 0, let full = fullChargeCapacityMah else { return nil }
+        return Int((Double(full) / Double(design) * 100).rounded())
+    }
+}
+
+func readHardwareBatteryInfo() -> HardwareBatteryInfo? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
+    process.arguments = ["-rn", "AppleSmartBattery", "-a"]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    do {
+        try process.run()
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [Any],
+              let entry = plist.first as? [String: Any] else { return nil }
+        let batteryData = entry["BatteryData"] as? [String: Any]
+        return HardwareBatteryInfo(
+            cycleCount: entry["CycleCount"] as? Int,
+            designCapacityMah: (batteryData?["DesignCapacity"] as? Int) ?? (entry["DesignCapacity"] as? Int),
+            fullChargeCapacityMah: (batteryData?["FullChargeCapacity"] as? Int) ?? (entry["AppleRawMaxCapacity"] as? Int),
+            temperatureCelsius: (entry["Temperature"] as? Double).map { $0 / 100 }
+        )
+    } catch {
+        return nil
+    }
 }
 
 // The hardware features batt's daemon detects; each command is gated by one (batt v0.8.0 cmd/batt).
@@ -109,6 +160,7 @@ class BattModel: ObservableObject {
     @Published var daemonReachable = true
     @Published var lastError: String?
     @Published var pmsetSleepDisabled = false
+    @Published var hardware: HardwareBatteryInfo?
 
     func run(_ args: [String], needsAdmin: Bool = true) {
         isBusy = true
@@ -132,10 +184,12 @@ class BattModel: ObservableObject {
             // "SleepDisabled 1" in `pmset -g` reflects `pmset disablesleep 1`; readable without sudo.
             let pmsetOutput = runCommand("/usr/bin/pmset", ["-g"], needsAdmin: false)
             let sleepDisabled = pmsetOutput.split(separator: "\n").contains { $0.trimmingCharacters(in: .whitespaces).hasPrefix("SleepDisabled 1") }
+            let hardware = readHardwareBatteryInfo()
             DispatchQueue.main.async {
                 self.daemonReachable = decoded != nil
                 if let decoded { self.status = decoded }
                 self.pmsetSleepDisabled = sleepDisabled
+                self.hardware = hardware
             }
         }
     }
@@ -359,6 +413,13 @@ struct BatteryGlyph: View {
     }
 }
 
+func timeRemainingLabel(for state: String, minutes: Int) -> String {
+    let hours = minutes / 60
+    let mins = minutes % 60
+    let duration = hours > 0 ? "\(hours)h \(mins)m" : "\(mins)m"
+    return state == "charging" ? "\(duration) until charge limit" : "\(duration) remaining"
+}
+
 struct BatteryPage: View {
     @EnvironmentObject private var model: BattModel
     @Binding var selection: Page?
@@ -371,8 +432,13 @@ struct BatteryPage: View {
                         BatteryGlyph(percent: s.battery.currentChargePercent)
                         VStack(alignment: .leading, spacing: 2) {
                             Text("\(s.battery.currentChargePercent)%").font(.system(size: 34, weight: .bold))
-                            Text("\(s.battery.state.capitalized) · \(s.charging.pluggedIn ? "Plugged in" : "On battery")")
+                            Text("\(s.humanState) · \(s.charging.pluggedIn ? "Plugged in" : "On battery")")
                                 .foregroundStyle(.secondary)
+                            if let minutes = s.battery.timeToLimitMinutes, minutes > 0 {
+                                Text(timeRemainingLabel(for: s.battery.state, minutes: minutes))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                         Spacer()
                         Grid(alignment: .trailing, horizontalSpacing: 20, verticalSpacing: 4) {
@@ -382,10 +448,27 @@ struct BatteryPage: View {
                             if let w = s.battery.chargeRateWatts {
                                 GridRow { Text("Charge rate").foregroundStyle(.secondary); Text(String(format: "%.1f W", w)) }
                             }
+                            if let cycles = model.hardware?.cycleCount {
+                                GridRow { Text("Cycle count").foregroundStyle(.secondary); Text("\(cycles)") }
+                            }
+                            if let health = model.hardware?.healthPercent {
+                                GridRow { Text("Battery health").foregroundStyle(.secondary); Text("\(health)%") }
+                            }
+                            if let t = model.hardware?.temperatureCelsius {
+                                GridRow { Text("Temperature").foregroundStyle(.secondary); Text(String(format: "%.0f°C", t)) }
+                            }
                         }
                         .font(.callout)
                     }
                     .padding(.vertical, 8)
+
+                    if let design = model.hardware?.designCapacityMah, let full = model.hardware?.fullChargeCapacityMah {
+                        LabeledContent("Full charge capacity") {
+                            Text("\(full) mAh of \(design) mAh design capacity")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
                 }
 
                 Section("Power") {
